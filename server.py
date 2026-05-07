@@ -19,6 +19,13 @@ Usage:
 """
 
 import os
+import sys
+
+# Force UTF-8 output on Windows to avoid emoji UnicodeEncodeError
+if sys.stdout.encoding != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if sys.stderr.encoding != "utf-8":
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import json
 import time
 import uuid
@@ -104,10 +111,17 @@ _HAS_ASYNC_SEND = False  # resolved in lifespan after engine is created
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global engine, _args, _HAS_ASYNC_SEND
+    
+    # Re-ensure UTF-8 output on Windows inside lifespan for child processes/threads
+    if sys.stdout.encoding != "utf-8":
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if sys.stderr.encoding != "utf-8":
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     _args = parse_args()
-    print(f"🔧  Backend : {_args.backend.upper()}")
-    print(f"📦  Model   : {_args.model}")
-    print(f"⏳  Loading model …")
+    print(f"[*] Backend : {_args.backend.upper()}")
+    print(f"[*] Model   : {_args.model}")
+    print(f"[*] Loading model ...")
 
     kwargs = {}
     if _args.max_tokens is not None:
@@ -126,8 +140,8 @@ async def lifespan(app: FastAPI):
     except Exception:
         _HAS_ASYNC_SEND = False
 
-    print(f"✅  Model loaded — streaming={'native' if _HAS_ASYNC_SEND else 'simulated'}")
-    print(f"✅  Server ready on {_args.host}:{_args.port}")
+    print(f"[OK] Model loaded - streaming={'native' if _HAS_ASYNC_SEND else 'simulated'}")
+    print(f"[OK] Server ready on {_args.host}:{_args.port}")
 
     yield  # server is running
 
