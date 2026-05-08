@@ -2,7 +2,7 @@ import subprocess
 import time
 
 print("Starting server.py...")
-server = subprocess.Popen(["python", "server.py"], stdout=open("server.log", "w"), stderr=subprocess.STDOUT)
+server = subprocess.Popen(["python", "server.py", "--port", "8001"], stdout=open("server.log", "w"), stderr=subprocess.STDOUT)
 time.sleep(2)
 
 print("Starting Asterisk...")

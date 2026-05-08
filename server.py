@@ -28,6 +28,17 @@ if sys.stderr.encoding != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import json
 import time
+import audioop
+try:
+    from pydub import AudioSegment
+    _HAS_PYDUB = True
+except ImportError:
+    _HAS_PYDUB = False
+try:
+    from faster_whisper import WhisperModel
+    _HAS_WHISPER = True
+except ImportError:
+    _HAS_WHISPER = False
 import uuid
 import shutil
 import asyncio
@@ -53,13 +64,30 @@ import litert_lm
 # ---------------------------------------------------------------------------
 def parse_args():
     parser = argparse.ArgumentParser(description="Gemma 4 OpenAI-Compatible Server")
+    
+    # Intelligent model path detection
+    default_model = os.environ.get("GEMMA_MODEL_PATH")
+    if not default_model:
+        # 1. Try standard expansion (~/gemma-server/...)
+        candidate = os.path.expanduser("~/gemma-server/gemma-4-E2B-it.litertlm")
+        if os.path.exists(candidate):
+            default_model = candidate
+        else:
+            # 2. Try WSL network path fallback if on Windows
+            if sys.platform == "win32":
+                # Known path for tharuka on Ubuntu
+                wsl_fallback = r"\\wsl.localhost\Ubuntu\home\tharuka\gemma-server\gemma-4-E2B-it.litertlm"
+                if os.path.exists(wsl_fallback):
+                    default_model = wsl_fallback
+                else:
+                    default_model = candidate
+            else:
+                default_model = candidate
+
     parser.add_argument(
         "--model",
         type=str,
-        default=os.environ.get(
-            "GEMMA_MODEL_PATH",
-            os.path.expanduser("~/gemma-server/gemma-4-E2B-it.litertlm"),
-        ),
+        default=default_model,
         help="Path to the .litertlm model file",
     )
     parser.add_argument(
@@ -425,15 +453,49 @@ def _convert_to_wav_ffmpeg(input_path: str, output_path: str) -> bool:
         return False
 
 
+def _convert_to_wav_pydub(input_path: str, output_path: str) -> bool:
+    if not _HAS_PYDUB:
+        print("[!] pydub not available for resampling", flush=True)
+        return False
+    try:
+        print(f"[*] Resampling with pydub: {input_path} -> {output_path}", flush=True)
+        audio = AudioSegment.from_file(input_path)
+        print(f"[*] Input audio: {audio.frame_rate}Hz, {audio.channels}ch, {audio.sample_width}bytes, {len(audio)}ms", flush=True)
+        audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+        audio.export(output_path, format="wav")
+        if os.path.exists(output_path):
+            print(f"[*] Resampling successful, size: {os.path.getsize(output_path)} bytes", flush=True)
+            return True
+        else:
+            print("[!] pydub export failed: file not created", flush=True)
+            return False
+    except Exception as e:
+        print(f"[!] pydub resampling failed: {e}", flush=True)
+        return False
+
+
 def _resample_to_16k(input_path: str) -> str:
     out_path = input_path + "_16k.wav"
+    print(f"[*] Checking if resampling is needed for {input_path} (size: {os.path.getsize(input_path)} bytes)", flush=True)
 
     if _convert_to_wav_ffmpeg(input_path, out_path):
+        print("[*] Resampled via ffmpeg", flush=True)
         try:
             os.remove(input_path)
         except OSError:
             pass
         return out_path
+
+    if _convert_to_wav_pydub(input_path, out_path):
+        print("[*] Resampled via pydub", flush=True)
+        try:
+            os.remove(input_path)
+        except OSError:
+            pass
+        return out_path
+
+    print("[!] All resampling methods failed or skipped, returning original path", flush=True)
+    return input_path
 
     try:
         with wave.open(input_path, "rb") as win:
@@ -490,7 +552,39 @@ def _resample_to_16k(input_path: str) -> str:
     return out_path
 
 
+_WHISPER_MODEL = None
+
+
+def _get_whisper():
+    global _WHISPER_MODEL
+    if not _HAS_WHISPER:
+        return None
+    if _WHISPER_MODEL is None:
+        print("[*] Loading Whisper model for STT fallback...", flush=True)
+        _WHISPER_MODEL = WhisperModel("base", device="cpu", compute_type="int8")
+    return _WHISPER_MODEL
+
+
 def _run_audio_inference(audio_path: str, prompt: str) -> str:
+    # Use Whisper STT because native LiteRT-LM audio processing is unstable on Windows
+    whisper = _get_whisper()
+    if whisper:
+        try:
+            print(f"[*] Transcribing audio with Whisper: {audio_path}", flush=True)
+            segments, info = whisper.transcribe(audio_path, beam_size=5)
+            transcript = " ".join(s.text for s in segments).strip()
+            print(f"[*] Whisper transcript: '{transcript}'", flush=True)
+            if transcript:
+                # Combine prompt and transcript
+                full_prompt = f"{prompt}\n\nAudio content: {transcript}"
+                # Send to Gemma as text
+                return _sync_generate(full_prompt, {}, 200, 0.7)
+            else:
+                return "Audio was silent or could not be transcribed."
+        except Exception as e:
+            print(f"[!] Whisper STT failed: {e}", flush=True)
+
+    # Fallback to native (which likely crashes, but kept for completeness)
     with _audio_lock:
         with engine.create_conversation() as conversation:
             user_message = {
@@ -500,7 +594,6 @@ def _run_audio_inference(audio_path: str, prompt: str) -> str:
                     {"type": "text", "text": prompt},
                 ],
             }
-            # FIX C applied here too — guard against gen_kwargs TypeError
             try:
                 response = conversation.send_message(user_message)
             except Exception:

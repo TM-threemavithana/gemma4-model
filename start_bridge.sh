@@ -43,10 +43,10 @@ WIN_IP=$(ip route show | grep -m1 default | awk '{print $3}')
 
 if [ -z "$WIN_IP" ]; then
     echo "⚠️  Could not detect Windows host IP, defaulting to localhost"
-    GEMMA_URL="http://localhost:8000"
+    GEMMA_URL="http://localhost:8001"
 else
     echo "🖥️  Windows host IP: $WIN_IP"
-    GEMMA_URL="http://${WIN_IP}:8000"
+    GEMMA_URL="http://${WIN_IP}:8001"
 fi
 
 # --- Check Gemma 4 server is reachable ---
