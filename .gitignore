@@ -17,6 +17,8 @@ venv.bak/
 *.litertlm
 *.bin
 *.onnx
+*.onnx.json
+piper-models/
 
 # Audio logs and temporary files
 *.wav

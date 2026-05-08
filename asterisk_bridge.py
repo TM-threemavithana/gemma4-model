@@ -6,6 +6,8 @@ Sits between Asterisk (AudioSocket protocol) and the Gemma 4 server.py.
 Architecture:
   SIP Softphone → Asterisk → [THIS FILE] → server.py (Gemma 4) → TTS → Asterisk → Caller
 
+TTS: Uses Piper TTS (local, ~50ms) instead of gTTS (internet, 2-4s).
+
 AudioSocket Protocol (Asterisk):
   Every TCP frame is:  [1-byte kind][2-byte big-endian length][payload]
   Kind 0x00 = UUID (16 bytes, sent once at connection start)
@@ -15,6 +17,7 @@ AudioSocket Protocol (Asterisk):
 Usage (run in WSL2):
   python3 asterisk_bridge.py
   python3 asterisk_bridge.py --port 9092 --gemma-url http://localhost:8000
+  python3 asterisk_bridge.py --piper-model /path/to/model.onnx
   python3 asterisk_bridge.py --debug   # verbose frame logging
 """
 
@@ -37,7 +40,12 @@ import logging
 from typing import Optional, List
 
 import httpx
-from gtts import gTTS
+
+try:
+    from piper.voice import PiperVoice
+except ImportError:
+    PiperVoice = None
+    print("ERROR: piper-tts not installed. Run: pip install piper-tts", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +64,7 @@ log = logging.getLogger("bridge")
 # ---------------------------------------------------------------------------
 DEFAULT_PORT         = 9092
 DEFAULT_GEMMA_URL    = "http://localhost:8000"
+DEFAULT_PIPER_MODEL  = os.path.expanduser("~/piper-models/en_US-amy-medium.onnx")
 DEFAULT_SYSTEM_MSG   = (
     "You are Gemma, a helpful AI voice assistant. "
     "Keep your answers SHORT — 2-3 sentences max. "
@@ -96,6 +105,45 @@ def get_whisper():
 
 
 # ---------------------------------------------------------------------------
+# Piper TTS (loaded once, shared across calls)
+# ---------------------------------------------------------------------------
+_piper_voice = None
+_piper_sample_rate = 22050   # updated on load from model config
+
+def load_piper(model_path: str):
+    """Load the Piper voice model. Call once at startup."""
+    global _piper_voice, _piper_sample_rate
+    if PiperVoice is None:
+        raise RuntimeError("piper-tts is not installed. Run: pip install piper-tts")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(
+            f"Piper model not found: {model_path}\n"
+            f"Download it with:\n"
+            f"  mkdir -p ~/piper-models\n"
+            f"  wget -O {model_path} "
+            f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/amy/medium/en_US-amy-medium.onnx\n"
+            f"  wget -O {model_path}.json "
+            f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/amy/medium/en_US-amy-medium.onnx.json"
+        )
+    config_path = model_path + ".json"
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(
+            f"Piper config not found: {config_path}\n"
+            f"Download it alongside the .onnx model."
+        )
+    log.info(f"⏳  Loading Piper TTS model: {os.path.basename(model_path)}")
+    _piper_voice = PiperVoice.load(model_path, config_path=config_path)
+    # Read sample rate from the loaded model config
+    _piper_sample_rate = _piper_voice.config.sample_rate
+    log.info(f"✅  Piper TTS loaded (sample rate: {_piper_sample_rate} Hz)")
+
+def get_piper() -> "PiperVoice":
+    if _piper_voice is None:
+        raise RuntimeError("Piper not loaded — call load_piper() first")
+    return _piper_voice
+
+
+# ---------------------------------------------------------------------------
 # Audio helpers
 # ---------------------------------------------------------------------------
 
@@ -111,30 +159,20 @@ def pcm8k_to_wav_bytes(pcm_frames: List[bytes]) -> bytes:
     return buf.getvalue()
 
 
-def mp3_to_pcm8k(mp3_bytes: bytes) -> bytes:
-    """
-    Convert MP3 bytes (gTTS output) → 8 kHz 16-bit mono PCM.
-    Uses pydub + audioop for resampling — no ffmpeg required when using
-    the built-in pure-Python fallback, but ffmpeg gives better quality.
-    Falls back gracefully if pydub/ffmpeg is unavailable.
-    """
-    try:
-        from pydub import AudioSegment
-        seg = AudioSegment.from_mp3(io.BytesIO(mp3_bytes))
-        seg = seg.set_frame_rate(8000).set_channels(1).set_sample_width(2)
-        return seg.raw_data
-    except Exception as e:
-        log.warning(f"pydub resampling failed ({e}), using audioop fallback")
-        # Very basic fallback: just return silence so the call doesn't crash
-        return b"\x00\x00" * 8000   # 1 second of silence
-
-
 def text_to_pcm8k(text: str) -> bytes:
-    """TTS: text → MP3 (gTTS) → 8 kHz PCM."""
-    tts = gTTS(text=text, lang="en", slow=False)
-    buf = io.BytesIO()
-    tts.write_to_fp(buf)
-    return mp3_to_pcm8k(buf.getvalue())
+    """
+    TTS: text → Piper (local, ~50ms) → resample to 8 kHz PCM.
+    No internet required. No MP3 intermediate.
+    """
+    voice = get_piper()
+    # Piper outputs raw 16-bit mono PCM at the model's native sample rate
+    # Using voice.synthesize() which yields AudioChunk objects
+    raw_audio = b"".join(chunk.audio_int16_bytes for chunk in voice.synthesize(text))
+    # Resample from model rate (e.g. 22050 Hz) → 8000 Hz for Asterisk
+    resampled, _ = audioop.ratecv(
+        raw_audio, 2, 1, _piper_sample_rate, 8000, None
+    )
+    return resampled
 
 
 def is_silent(frame: bytes, threshold: int = SILENCE_THRESHOLD_DB) -> bool:
@@ -356,13 +394,16 @@ async def handle_call(
 # Main server
 # ---------------------------------------------------------------------------
 
-async def main(port: int, gemma_url: str, system_msg: str, debug: bool):
+async def main(port: int, gemma_url: str, system_msg: str, piper_model: str, debug: bool):
     if debug:
         log.setLevel(logging.DEBUG)
 
-    # Pre-load Whisper so the first call isn't slow
+    # Pre-load models so the first call isn't slow
     log.info("⏳  Pre-loading Whisper model…")
     await asyncio.to_thread(get_whisper)
+
+    log.info("⏳  Pre-loading Piper TTS model…")
+    await asyncio.to_thread(load_piper, piper_model)
 
     server = await asyncio.start_server(
         lambda r, w: handle_call(r, w, gemma_url, system_msg, debug),
@@ -372,6 +413,7 @@ async def main(port: int, gemma_url: str, system_msg: str, debug: bool):
     addr = server.sockets[0].getsockname()
     log.info(f"✅  AudioSocket bridge listening on {addr[0]}:{addr[1]}")
     log.info(f"    Gemma 4 URL : {gemma_url}")
+    log.info(f"    Piper model : {os.path.basename(piper_model)}")
     log.info(f"    System msg  : {system_msg[:60]}…")
     log.info("    Waiting for Asterisk connections… (Ctrl+C to stop)")
 
@@ -389,6 +431,8 @@ def parse_args():
                    help=f"TCP port to listen on (default {DEFAULT_PORT})")
     p.add_argument("--gemma-url", default=DEFAULT_GEMMA_URL,
                    help=f"Base URL of server.py (default {DEFAULT_GEMMA_URL})")
+    p.add_argument("--piper-model", default=DEFAULT_PIPER_MODEL,
+                   help=f"Path to Piper .onnx model (default {DEFAULT_PIPER_MODEL})")
     p.add_argument("--system-msg", default=DEFAULT_SYSTEM_MSG,
                    help="System prompt for Gemma 4")
     p.add_argument("--silence-threshold", type=int, default=SILENCE_THRESHOLD_DB,
@@ -402,6 +446,6 @@ if __name__ == "__main__":
     args = parse_args()
     SILENCE_THRESHOLD_DB = args.silence_threshold
     try:
-        asyncio.run(main(args.port, args.gemma_url, args.system_msg, args.debug))
+        asyncio.run(main(args.port, args.gemma_url, args.system_msg, args.piper_model, args.debug))
     except KeyboardInterrupt:
         log.info("Bridge stopped.")

@@ -1,15 +1,14 @@
-# Asterisk Calling Agent — extra dependencies
+# Asterisk Calling Agent — dependencies
 # Run: pip install -r requirements_calling.txt
 
-# Already installed (from your Jupyter notebook):
-# faster-whisper
-# gTTS
-# pydub
+# STT
+# faster-whisper  (installed separately — needs special build)
 
-# New additions:
-httpx>=0.27.0          # async HTTP client for Gemma 4 requests
-pydub>=0.25.1          # audio format conversion (MP3→PCM)
+# TTS — Piper runs 100% locally, no internet needed (~50ms vs 2-4s for gTTS)
+piper-tts
 
+# Async HTTP client for Gemma 4 requests
+httpx>=0.27.0
 
 # Optional but recommended for better voice activity detection:
 # webrtcvad-wheels>=2.0.14   # uncomment for production-grade VAD
