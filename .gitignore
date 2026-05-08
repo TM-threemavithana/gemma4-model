@@ -19,15 +19,19 @@ venv.bak/
 *.onnx
 *.onnx.json
 piper-models/
+assets/models/
 
 # Audio logs and temporary files
 *.wav
 *.mp3
 *.log
+logs/
+output/
 linphone_qr.png
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints
+notebooks/
 
 # OS generated files
 .DS_Store

@@ -1,0 +1,36 @@
+import os
+import sys
+from pathlib import Path
+
+# Base Directory
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
+# Model Paths
+DEFAULT_MODEL = os.environ.get("GEMMA_MODEL_PATH")
+if not DEFAULT_MODEL:
+    candidate = os.path.expanduser("~/gemma-server/gemma-4-E2B-it.litertlm")
+    if os.path.exists(candidate):
+        DEFAULT_MODEL = candidate
+    elif sys.platform == "win32":
+        wsl_fallback = r"\\wsl.localhost\Ubuntu\home\tharuka\gemma-server\gemma-4-E2B-it.litertlm"
+        if os.path.exists(wsl_fallback):
+            DEFAULT_MODEL = wsl_fallback
+
+MODEL_PATH = os.getenv("MODEL_PATH", DEFAULT_MODEL or "assets/models/gemma-4-E2B-it.litertlm")
+PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", os.path.expanduser("~/piper-models/en_US-amy-medium.onnx"))
+
+# Network Settings
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", 8000))
+ASTERISK_PORT = int(os.getenv("ASTERISK_PORT", 9092))
+GEMMA_URL = os.getenv("GEMMA_URL", f"http://localhost:{PORT}")
+
+# Inference Settings
+BACKEND = os.getenv("GEMMA_BACKEND", "cpu")
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", 2048))
+TEMPERATURE = float(os.getenv("TEMPERATURE", 0.7))
+
+# Logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
