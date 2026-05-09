@@ -19,6 +19,16 @@ if not DEFAULT_MODEL:
 MODEL_PATH = os.getenv("MODEL_PATH", DEFAULT_MODEL or "assets/models/gemma-4-E2B-it.litertlm")
 PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", os.path.expanduser("~/piper-models/en_US-amy-medium.onnx"))
 
+# Kokoro TTS Settings
+KOKORO_MODEL_DIR = os.getenv("KOKORO_MODEL_DIR", os.path.expanduser("~/kokoro-models"))
+KOKORO_MODEL_FILE = os.path.join(KOKORO_MODEL_DIR, "kokoro-v1.0.onnx")
+KOKORO_VOICES_FILE = os.path.join(KOKORO_MODEL_DIR, "voices-v1.0.bin")
+KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_sarah")
+KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "1.0"))
+
+# TTS Engine selection: "kokoro" or "piper"
+TTS_ENGINE = os.getenv("TTS_ENGINE", "kokoro")
+
 # Network Settings
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", 8000))

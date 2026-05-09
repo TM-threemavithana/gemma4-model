@@ -1,17 +1,21 @@
 import asyncio
 import struct
+import json
 import logging
 import httpx
 from typing import List, Optional
-from src.config.settings import GEMMA_URL, PIPER_MODEL_PATH
+from src.config.settings import GEMMA_URL, PIPER_MODEL_PATH, TTS_ENGINE
 from src.config.constants import (
     KIND_UUID, KIND_AUDIO, KIND_HANGUP, FRAME_SIZE, 
     SILENCE_FRAMES_NEEDED, MIN_SPEECH_FRAMES, MAX_SPEECH_FRAMES,
     DEFAULT_SYSTEM_MSG
 )
 from src.adapters.piper import PiperAdapter
+from src.adapters.kokoro import KokoroAdapter
 from src.adapters.whisper import WhisperAdapter
-from src.core.audio import is_silent, pcm8k_to_wav_bytes
+from src.adapters.vad import VADAdapter
+from src.core.audio import pcm8k_to_wav_bytes
+from src.tools.registry import TOOLS, TOOL_MAP
 
 log = logging.getLogger("bridge")
 
@@ -19,12 +23,30 @@ class AudioSocketBridge:
     def __init__(self, gemma_url: str = GEMMA_URL, system_msg: str = DEFAULT_SYSTEM_MSG):
         self.gemma_url = gemma_url
         self.system_msg = system_msg
-        self.piper = PiperAdapter(PIPER_MODEL_PATH)
+        
+        if TTS_ENGINE == "kokoro":
+            self.tts = KokoroAdapter()
+        else:
+            self.tts = PiperAdapter(PIPER_MODEL_PATH)
+            
         self.whisper = WhisperAdapter()
+        self.vad = VADAdapter(threshold=0.5)
+        self.greeting_cache: Optional[bytes] = None
+        self.playback_task: Optional[asyncio.Task] = None
 
     async def start(self, port: int):
-        self.piper.load()
+        self.tts.load()
         self.whisper.load()
+        
+        # Pre-synthesize greeting to eliminate delay
+        greeting = "Hello! I'm Gemma, your AI assistant. How can I help you today?"
+        log.info("🔊 Pre-synthesizing greeting...")
+        try:
+            self.greeting_cache = await asyncio.to_thread(self.tts.synthesize_to_pcm8k, greeting)
+            log.info("✅ Greeting ready")
+        except Exception as e:
+            log.error(f"❌ Pre-synthesis failed: {e}")
+
         server = await asyncio.start_server(self.handle_call, "0.0.0.0", port)
         log.info(f"✅ AudioSocket bridge listening on port {port}")
         async with server:
@@ -43,14 +65,17 @@ class AudioSocketBridge:
             elif kind is not None:
                 log.warning(f"   [Handshake] First frame was not UUID (kind=0x{kind:02x})")
 
-            # 2. Play initial greeting
+            # 2. Start initial greeting as a background task (interruptible)
             greeting = "Hello! I'm Gemma, your AI assistant. How can I help you today?"
-            log.info(f"🔊 Greeting: {greeting}")
+            log.info(f"🔊 Starting greeting...")
             try:
-                greeting_pcm = await asyncio.to_thread(self.piper.synthesize_to_pcm8k, greeting)
-                await self.write_audio(writer, greeting_pcm)
+                if self.greeting_cache:
+                    greeting_pcm = self.greeting_cache
+                else:
+                    greeting_pcm = await asyncio.to_thread(self.tts.synthesize_to_pcm8k, greeting)
+                self.playback_task = asyncio.create_task(self.write_audio(writer, greeting_pcm))
             except Exception as e:
-                log.error(f"❌ Greeting synthesis failed: {e}")
+                log.error(f"❌ Greeting setup failed: {e}")
 
             # 3. Conversation loop
             history = []
@@ -74,14 +99,20 @@ class AudioSocketBridge:
                         log.debug(f"   Skipping non-audio frame (kind=0x{kind:02x})")
                         continue
 
-                    if is_silent(payload):
-                        silence_count += 1
-                        if speaking:
-                            speech_buf.append(payload)
-                    else:
+                    if self.vad.is_speech(payload):
+                        # 🚨 BARGE-IN CHECK
+                        if self.playback_task and not self.playback_task.done():
+                            log.info("✂️ User interrupted AI (Speech detected)")
+                            self.playback_task.cancel()
+                            self.playback_task = None
+                        
                         silence_count = 0
                         speaking = True
                         speech_buf.append(payload)
+                    else:
+                        silence_count += 1
+                        if speaking:
+                            speech_buf.append(payload)
 
                     # Flush speech
                     if (speaking and silence_count >= SILENCE_FRAMES_NEEDED) or len(speech_buf) >= MAX_SPEECH_FRAMES:
@@ -102,14 +133,19 @@ class AudioSocketBridge:
 
                                 if user_text:
                                     log.info(f"👤 User: {user_text}")
-                                    reply = await self.ask_gemma(client, user_text, history)
+                                    # Add user message to history once
+                                    history.append({"role": "user", "content": user_text})
+                                    
+                                    # Ask Gemma (this will handle tools internally)
+                                    reply = await self.ask_gemma(client, history)
                                     log.info(f"🤖 Gemma: {reply}")
                                     
-                                    history.append({"role": "user", "content": user_text})
+                                    # Add assistant response to history
                                     history.append({"role": "assistant", "content": reply})
                                     
-                                    reply_pcm = await asyncio.to_thread(self.piper.synthesize_to_pcm8k, reply)
-                                    await self.write_audio(writer, reply_pcm)
+                                    reply_pcm = await asyncio.to_thread(self.tts.synthesize_to_pcm8k, reply)
+                                    # Start playback as a background task to allow interruptions
+                                    self.playback_task = asyncio.create_task(self.write_audio(writer, reply_pcm))
                                 else:
                                     log.info("   (empty transcription)")
                             except Exception as e:
@@ -144,21 +180,70 @@ class AudioSocketBridge:
             return None, None
 
     async def write_audio(self, writer, pcm_data):
-        offset = 0
-        while offset < len(pcm_data):
-            chunk = pcm_data[offset:offset+FRAME_SIZE]
-            if len(chunk) < FRAME_SIZE:
-                chunk += b"\x00" * (FRAME_SIZE - len(chunk))
-            frame = bytes([KIND_AUDIO]) + struct.pack(">H", FRAME_SIZE) + chunk
-            writer.write(frame)
-            offset += FRAME_SIZE
-        await writer.drain()
-
-    async def ask_gemma(self, client, text, history):
-        messages = [{"role": "system", "content": self.system_msg}] + history + [{"role": "user", "content": text}]
+        """Sends audio to Asterisk in real-time chunks (20ms) to allow for interruption."""
         try:
-            resp = await client.post(f"{self.gemma_url}/v1/chat/completions", json={"messages": messages}, timeout=30)
-            return resp.json()["choices"][0]["message"]["content"]
+            offset = 0
+            while offset < len(pcm_data):
+                chunk = pcm_data[offset:offset+FRAME_SIZE]
+                if len(chunk) < FRAME_SIZE:
+                    chunk += b"\x00" * (FRAME_SIZE - len(chunk))
+                
+                frame = bytes([KIND_AUDIO]) + struct.pack(">H", FRAME_SIZE) + chunk
+                writer.write(frame)
+                await writer.drain()
+                
+                offset += FRAME_SIZE
+                # FRAME_SIZE is 320 bytes (160 samples at 8kHz) = 20ms of audio
+                await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            # Task was cancelled due to barge-in
+            raise
         except Exception as e:
-            log.error(f"Gemma error: {e}")
-            return "Sorry, I had trouble thinking."
+            log.error(f"Error in write_audio: {e}")
+
+    async def ask_gemma(self, client, history):
+        """Recursively queries Gemma, executing any requested tools until a final text response is received."""
+        messages = [{"role": "system", "content": self.system_msg}] + history
+        
+        try:
+            # Send request with tools enabled
+            payload = {"messages": messages, "tools": TOOLS}
+            resp = await client.post(f"{self.gemma_url}/v1/chat/completions", json=payload, timeout=30)
+            data = resp.json()
+            message = data["choices"][0]["message"]
+            
+            # If Gemma wants to call a tool
+            if "tool_calls" in message:
+                tool_calls = message["tool_calls"]
+                # Add the tool call message to history
+                history.append(message)
+                
+                for tool_call in tool_calls:
+                    func_info = tool_call.get("function", {})
+                    name = func_info.get("name")
+                    args_raw = func_info.get("arguments", "{}")
+                    
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                    
+                    if name in TOOL_MAP:
+                        log.info(f"🛠️ Executing tool: {name}({args})")
+                        result = TOOL_MAP[name](**args)
+                        
+                        # Add tool result to history
+                        history.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.get("id", "call_123"),
+                            "name": name,
+                            "content": str(result)
+                        })
+                    else:
+                        log.warning(f"⚠️ Tool {name} not found in registry")
+
+                # Re-query Gemma with the tool results included in history
+                return await self.ask_gemma(client, history)
+
+            # No more tool calls, return the final text
+            return message.get("content") or ""
+        except Exception as e:
+            log.error(f"Gemma tool loop error: {e}")
+            return "Sorry, I'm having trouble responding right now."

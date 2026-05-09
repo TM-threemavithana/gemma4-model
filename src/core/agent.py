@@ -11,12 +11,14 @@ class GemmaAgent:
         self.whisper = whisper
         self._audio_lock = threading.Lock()
 
-    async def generate_text(self, prompt: str, history: Optional[List[Dict[str, str]]] = None, system_msg: Optional[str] = None) -> str:
+    async def generate_text(self, prompt: str, history: Optional[List[Dict[str, str]]] = None, system_msg: Optional[str] = None, tools: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         conv_kwargs = {}
         if system_msg:
             conv_kwargs["system_message"] = system_msg
         if history:
             conv_kwargs["messages"] = history
+        if tools:
+            conv_kwargs["tools"] = tools
 
         last_message = {"role": "user", "content": [{"type": "text", "text": prompt}]}
         
@@ -30,10 +32,8 @@ class GemmaAgent:
             except TypeError:
                 response = conversation.send_message(last_message)
             
-            if isinstance(response, dict):
-                parts = response.get("content", [])
-                return "".join(p.get("text", "") for p in parts if p.get("type") == "text")
-            return str(response)
+            # Return the raw response dictionary so the caller can check for tool_calls
+            return response
 
     async def generate_from_audio(self, audio_path: str, prompt: str) -> str:
         if self.whisper:

@@ -2,8 +2,6 @@ import argparse
 import asyncio
 import logging
 import threading
-import uvicorn
-from src.api.server import app
 from src.bridge.socket import AudioSocketBridge
 from src.config.settings import HOST, PORT, ASTERISK_PORT, LOG_LEVEL
 
@@ -18,6 +16,8 @@ async def run_bridge():
     await bridge.start(ASTERISK_PORT)
 
 def run_server():
+    import uvicorn
+    from src.api.server import app
     uvicorn.run(app, host=HOST, port=PORT, log_level=LOG_LEVEL.lower())
 
 def main():

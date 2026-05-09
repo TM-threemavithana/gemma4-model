@@ -2,6 +2,7 @@
 SAMPLE_RATE_16K = 16000
 SAMPLE_RATE_8K = 8000
 SAMPLE_RATE_PIPER = 22050  # Default, can be updated from model config
+SAMPLE_RATE_KOKORO = 24000
 
 # Silence Detection
 SILENCE_THRESHOLD = 500
