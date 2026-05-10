@@ -19,6 +19,8 @@ FRAME_SIZE = 320  # 160 samples * 2 bytes @ 8kHz (20ms)
 
 # LLM Constants
 MODEL_ID = "gemma-4-e2b-it"
+SILENCE_PROACTIVE_TIMEOUT = 10.0
+SILENCE_HANGUP_TIMEOUT = 30.0
 DEFAULT_SYSTEM_MSG = (
     "You are Gemma, a helpful AI voice assistant. "
     "Keep your answers SHORT — 2-3 sentences max. "

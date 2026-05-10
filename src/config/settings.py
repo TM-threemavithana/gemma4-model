@@ -44,3 +44,9 @@ TEMPERATURE = float(os.getenv("TEMPERATURE", 0.7))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
+
+# Data Persistence
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+DB_PATH = str(DATA_DIR / "calls.db")
+TEMP_AUDIO_DIR = str(DATA_DIR / "temp_audio")

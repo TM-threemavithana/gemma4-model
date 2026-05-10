@@ -2,8 +2,11 @@ import argparse
 import asyncio
 import logging
 import threading
+import httpx
 from src.bridge.socket import AudioSocketBridge
-from src.config.settings import HOST, PORT, ASTERISK_PORT, LOG_LEVEL
+from src.config.settings import HOST, PORT, ASTERISK_PORT, LOG_LEVEL, GEMMA_URL
+from src.storage.database import init_db
+from src.core import post_processing
 
 def setup_logging():
     logging.basicConfig(
@@ -11,7 +14,41 @@ def setup_logging():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
+async def my_gemma_summarise(text):
+    """Enrichment: Summarize conversation."""
+    try:
+        async with httpx.AsyncClient() as client:
+            payload = {
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant. Summarize the following conversation transcript into a single, concise sentence focusing on the user's intent."},
+                    {"role": "user", "content": text}
+                ]
+            }
+            resp = await client.post(f"{GEMMA_URL}/v1/chat/completions", json=payload, timeout=30)
+            return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"Summary failed: {e}"
+
+async def my_gemma_sentiment(text):
+    """Enrichment: Analyze sentiment."""
+    try:
+        async with httpx.AsyncClient() as client:
+            payload = {
+                "messages": [
+                    {"role": "system", "content": "Analyze the sentiment of the following conversation transcript. Respond with ONLY one word: Positive, Neutral, or Negative."},
+                    {"role": "user", "content": text}
+                ]
+            }
+            resp = await client.post(f"{GEMMA_URL}/v1/chat/completions", json=payload, timeout=15)
+            return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"Sentiment failed: {e}"
+
 async def run_bridge():
+    # Configure post-processing
+    post_processing.summarise_fn = my_gemma_summarise
+    post_processing.sentiment_fn = my_gemma_sentiment
+    
     bridge = AudioSocketBridge()
     await bridge.start(ASTERISK_PORT)
 
@@ -22,6 +59,7 @@ def run_server():
 
 def main():
     setup_logging()
+    init_db()
     parser = argparse.ArgumentParser(description="Gemma 4 Multi-Interface AI")
     parser.add_argument("--mode", choices=["all", "api", "bridge"], default="all")
     args = parser.parse_args()

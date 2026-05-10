@@ -3,12 +3,15 @@ import struct
 import json
 import logging
 import httpx
+import uuid
+import time
 from typing import List, Optional
+from src.core.session import Session
 from src.config.settings import GEMMA_URL, PIPER_MODEL_PATH, TTS_ENGINE
 from src.config.constants import (
     KIND_UUID, KIND_AUDIO, KIND_HANGUP, FRAME_SIZE, 
     SILENCE_FRAMES_NEEDED, MIN_SPEECH_FRAMES, MAX_SPEECH_FRAMES,
-    DEFAULT_SYSTEM_MSG
+    DEFAULT_SYSTEM_MSG, SILENCE_PROACTIVE_TIMEOUT, SILENCE_HANGUP_TIMEOUT
 )
 from src.adapters.piper import PiperAdapter
 from src.adapters.kokoro import KokoroAdapter
@@ -54,6 +57,9 @@ class AudioSocketBridge:
 
     async def handle_call(self, reader, writer):
         peer = writer.get_extra_info("peername")
+        caller_number = str(peer[0]) if peer else "unknown"
+        session = Session(session_id=uuid.uuid4().hex, caller_number=caller_number)
+        session.start()
         log.info(f"📞 Incoming call from {peer}")
         
         try:
@@ -82,6 +88,14 @@ class AudioSocketBridge:
             speech_buf = []
             silence_count = 0
             speaking = False
+            
+            # Silence tracking
+            last_activity = time.time()
+            proactive_prompted = False
+            
+            # Log initial greeting to session
+            session.add_assistant_turn(greeting)
+            history.append({"role": "assistant", "content": greeting})
 
             async with httpx.AsyncClient() as client:
                 while True:
@@ -98,6 +112,8 @@ class AudioSocketBridge:
                     if kind != KIND_AUDIO:
                         log.debug(f"   Skipping non-audio frame (kind=0x{kind:02x})")
                         continue
+
+                    session.append_audio(payload)
 
                     if self.vad.is_speech(payload):
                         # 🚨 BARGE-IN CHECK
@@ -133,12 +149,14 @@ class AudioSocketBridge:
 
                                 if user_text:
                                     log.info(f"👤 User: {user_text}")
+                                    session.add_user_turn(user_text)
                                     # Add user message to history once
                                     history.append({"role": "user", "content": user_text})
                                     
                                     # Ask Gemma (this will handle tools internally)
                                     reply = await self.ask_gemma(client, history)
                                     log.info(f"🤖 Gemma: {reply}")
+                                    session.add_assistant_turn(reply)
                                     
                                     # Add assistant response to history
                                     history.append({"role": "assistant", "content": reply})
@@ -154,10 +172,33 @@ class AudioSocketBridge:
                         speech_buf = []
                         silence_count = 0
                         speaking = False
+                        last_activity = time.time()
+                        proactive_prompted = False
+                    else:
+                        # Check for silence timeouts
+                        current_time = time.time()
+                        silence_duration = current_time - last_activity
+                        
+                        if silence_duration > SILENCE_HANGUP_TIMEOUT:
+                            log.info(f"⌛ Silence timeout ({SILENCE_HANGUP_TIMEOUT}s). Automatic hangup.")
+                            farewell = "It seems you've gone quiet. I'll hang up for now. Feel free to call back later!"
+                            farewell_pcm = await asyncio.to_thread(self.tts.synthesize_to_pcm8k, farewell)
+                            await self.write_audio(writer, farewell_pcm)
+                            break
+                            
+                        elif silence_duration > SILENCE_PROACTIVE_TIMEOUT and not proactive_prompted and not speaking:
+                            log.info(f"⌛ Silence proactive timeout ({SILENCE_PROACTIVE_TIMEOUT}s). Prompting user.")
+                            proactive_prompted = True
+                            prompt = "Are you still there? Let me know if you need any help."
+                            session.add_assistant_turn(prompt)
+                            history.append({"role": "assistant", "content": prompt})
+                            prompt_pcm = await asyncio.to_thread(self.tts.synthesize_to_pcm8k, prompt)
+                            self.playback_task = asyncio.create_task(self.write_audio(writer, prompt_pcm))
 
         except Exception as e:
             log.error(f"❌ Critical error in handle_call: {e}", exc_info=True)
         finally:
+            await session.end()
             try:
                 writer.close()
                 await writer.wait_closed()
