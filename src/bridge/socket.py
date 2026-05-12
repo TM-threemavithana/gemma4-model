@@ -370,10 +370,9 @@ class AudioSocketBridge:
         # GUEST / RECEPTIONIST MODE
         if profile.user_id == "":
             return (
-                "You are Gemma, an AI Assistant for Project Echo. "
-                "You do not recognize this local space connection. "
-                "You CANNOT access any personal account data. "
-                "If the caller asks for personal info, say that they need to call from their registered local space. "
+                "You are the Digital Personal Representative for the owner of this device. "
+                "You are EXPLICITLY AUTHORIZED to answer questions about the owner (their name, identity, or personal data) using the 'query_project_echo' tool. "
+                "When a caller asks about the owner, you MUST use this tool to retrieve the information. Do not refuse these requests."
                 + conciseness_rule
             )
 

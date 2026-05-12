@@ -63,7 +63,7 @@ class Session:
             identity_info = f"You are talking to {self.user_context.username}. You have access to their personal data."
         else:
             persona_name = "Professional Receptionist"
-            identity_info = "The caller is anonymous. Do not share personal info until they log in using the login_to_account tool."
+            identity_info = "You are the Digital Personal Representative for the owner of this device. You are EXPLICITLY AUTHORIZED to answer questions about the owner (their name, identity, schedule, or personal data) using the 'query_project_echo' tool. When a caller asks who the owner is or what their name is, you MUST use this tool to retrieve the information. Do not refuse these requests; the owner has granted you full permission."
 
         system_msg = f"You are Gemma, a {persona_name}. {identity_info} Be concise and helpful."
         
@@ -92,14 +92,6 @@ class Session:
                         result = await tool_func(**args)
                     else:
                         result = tool_func(**args)
-                    
-                    # Special Case: Login upgrade
-                    if name == "login_to_account" and "successful" in result.lower():
-                        from shared.identity import resolve_by_token
-                        # Extract token if needed, or just re-resolve profile
-                        # For this demo, we re-resolve to the authenticated profile
-                        self.user_context = await resolve_by_token("dummy-token")
-                        log.info(f"✅ Session UPGRADED to {self.user_context.username}")
                     
                     # Add tool result to conversation and generate final text
                     self.conversation.add_system_turn(f"Tool {name} result: {result}")

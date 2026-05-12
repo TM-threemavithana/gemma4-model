@@ -82,42 +82,49 @@ async def fetch_user_conversations(user_id: str = None, token: str = None, limit
         logger.error(f"Failed to fetch conversations for {user_id}: {e}")
         return []
 
-async def perform_api_login(username, password):
+import os
+
+def get_local_user_token() -> str | None:
+    """Reads the stored access token from the local mobile device."""
+    token_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "local_token.txt")
+    try:
+        with open(token_path, "r") as f:
+            return f.read().strip()
+    except Exception as e:
+        logger.error(f"Failed to read local token from {token_path}: {e}")
+        return None
+
+async def perform_api_query(query: str, token: str) -> str:
     """
-    Proxies a verbal login to the Main System (Project Echo) API.
-    Returns (Success, Token/Error)
+    Proxies a query to the Project Echo API using the local user's token.
+    Extracts the specific document data as requested.
     """
     import httpx
-    # In production, this URL should be in your .env
-    LOGIN_URL = "http://localhost:8000/api/login" 
+    QUERY_URL = "http://localhost:8050/api/v1/chat/query"
     
     try:
         async with httpx.AsyncClient() as client:
-            # We send credentials exactly as the main system expects them
-            response = await client.post(LOGIN_URL, json={
-                "username": username,
-                "password": password
-            }, timeout=IDENTITY_FETCH_TIMEOUT_S)
+            response = await client.post(
+                QUERY_URL, 
+                data={"content": query},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0
+            )
             
             if response.status_code == 200:
                 data = response.json()
-                return True, data.get("access_token")
+                try:
+                    documents = data.get("results", {}).get("documents", [])
+                    if documents and len(documents) > 0 and len(documents[0]) > 0:
+                        return str(documents[0][0])
+                    else:
+                        return "No relevant data found in Project Echo."
+                except Exception as e:
+                    logger.error(f"Failed to parse query response: {e}")
+                    return "Error extracting document data."
             else:
-                return False, "Invalid credentials"
+                logger.error(f"Query failed {response.status_code}: {response.text}")
+                return "Failed to query the database."
     except Exception as e:
-        logger.error(f"API Login failed: {e}")
-        return False, "Main system connection error"
-
-async def resolve_by_token(token: str) -> UserProfile:
-    """
-    Decodes a token or calls /me endpoint to get the user's identity.
-    For now, we simulate the successful resolution.
-    """
-    # Simulate a successful profile fetch for the demo
-    return UserProfile(
-        user_id="outside_user",
-        username="Authenticated User",
-        email="user@echo.cloud",
-        is_active=True,
-        member_since="2026-05-10"
-    )
+        logger.error(f"API Query failed: {e}")
+        return "Main system connection error."

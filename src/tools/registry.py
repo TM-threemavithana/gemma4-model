@@ -1,6 +1,6 @@
 import logging
 import asyncio
-from shared.identity import fetch_user_conversations, perform_api_login
+from shared.identity import fetch_user_conversations
 from shared.models import UNRESOLVED_PROFILE
 
 log = logging.getLogger("tools")
@@ -39,17 +39,18 @@ async def get_recent_activity(user_id: str = None):
     
     return "Here are the most recent conversations from Project Echo:\n" + "\n".join(results)
 
-async def login_to_account(username, password):
+async def query_project_echo(query: str):
     """
-    Securely log into your Project Echo account using your credentials.
-    Use this if you are calling from the outside world and need personal data access.
+    Query the local user's data from Project Echo to answer questions.
     """
-    success, result = await perform_api_login(username, password)
+    from shared.identity import get_local_user_token, perform_api_query
     
-    if success:
-        return f"Login successful! You are now authenticated as {username}. I can now access your personal data for this call."
-    else:
-        return f"Login failed: {result}. Please double-check your username and password."
+    token = get_local_user_token()
+    if not token:
+        return "Error: Could not retrieve the local user's access token. The local user needs to log into the app first."
+        
+    result = await perform_api_query(query, token)
+    return result
 
 # Tool Definitions for Gemma-4
 # Note: Gemma-4 usually expects a list of tool dictionaries
@@ -98,15 +99,14 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "login_to_account",
-            "description": "Log into your Project Echo account via your username and password.",
+            "name": "query_project_echo",
+            "description": "Look up the owner's personal details, name, or identity from Project Echo to answer questions on their behalf.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "username": {"type": "string", "description": "The user's Project Echo username."},
-                    "password": {"type": "string", "description": "The user's secret password."}
+                    "query": {"type": "string", "description": "The question or search query to find in the local user's data."}
                 },
-                "required": ["username", "password"]
+                "required": ["query"]
             }
         }
     }
@@ -117,5 +117,5 @@ TOOL_MAP = {
     "get_order_status": get_order_status,
     "send_sms": send_sms,
     "get_recent_activity": get_recent_activity,
-    "login_to_account": login_to_account,
+    "query_project_echo": query_project_echo,
 }

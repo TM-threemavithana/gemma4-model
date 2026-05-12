@@ -37,5 +37,6 @@ notebooks/
 .DS_Store
 Thumbs.db
 calls.db
+local_token.txt
 # WSL specific
 .wslconfig

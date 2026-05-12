@@ -76,21 +76,51 @@ async def chat_completions(request: Request):
         history = [m for m in history if m["role"] != "system"]
     
         tools_json = body.get("tools")
-        
-        # LiteRT LM requires actual Python callables for tools
+
+        # LiteRT requires actual Python callables — wrap async tools in sync thread-safe runners
+        import threading
         from src.tools.registry import TOOL_MAP
+
+        def make_sync_wrapper(async_func):
+            """Runs an async tool in a dedicated thread+event loop so LiteRT can call it synchronously.
+            functools.wraps copies the original signature so inspect.signature() sees the real params."""
+            import functools
+            @functools.wraps(async_func)
+            def sync_wrapper(*args, **kwargs):
+                result_holder = [None]
+                exc_holder = [None]
+                def run():
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        result_holder[0] = loop.run_until_complete(async_func(*args, **kwargs))
+                    except Exception as e:
+                        exc_holder[0] = e
+                    finally:
+                        loop.close()
+                t = threading.Thread(target=run)
+                t.start()
+                t.join()
+                if exc_holder[0]:
+                    raise exc_holder[0]
+                return result_holder[0]
+            return sync_wrapper
+
         resolved_tools = []
         if tools_json:
             for t in tools_json:
                 name = t.get("function", {}).get("name")
                 if name in TOOL_MAP:
-                    resolved_tools.append(TOOL_MAP[name])
-    
-        if stream:
-            # For simplicity in this initial refactor, we'll implement a basic stream
-            return StreamingResponse(_mock_stream(prompt), media_type="text/event-stream")
-        
-        agent_response = await agent.generate_text(prompt, history=history, system_msg=system_msg, tools=resolved_tools)
+                    func = TOOL_MAP[name]
+                    if asyncio.iscoroutinefunction(func):
+                        resolved_tools.append(make_sync_wrapper(func))
+                    else:
+                        resolved_tools.append(func)
+
+        agent_response = await agent.generate_text(
+            prompt, history=history, system_msg=system_msg,
+            tools=resolved_tools if resolved_tools else None
+        )
         
         # Handle the response structure
         message_content = ""
