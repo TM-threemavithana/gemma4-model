@@ -60,6 +60,9 @@ class AudioSocketBridge:
         caller_number = str(peer[0]) if peer else "unknown"
         session = Session(session_id=uuid.uuid4().hex, caller_number=caller_number)
         session.start()
+        # 0. Fire identity fetch silently — runs while greeting plays
+        asyncio.create_task(session.preload_user_context())
+        
         log.info(f"📞 Incoming call from {peer}")
         
         try:
@@ -153,8 +156,18 @@ class AudioSocketBridge:
                                     # Add user message to history once
                                     history.append({"role": "user", "content": user_text})
                                     
+                                    # Wait up to 2s for context before first real LLM call.
+                                    # Greeting already took ~3s to play — context is almost always ready.
+                                    try:
+                                        await asyncio.wait_for(session.context_ready.wait(), timeout=2.0)
+                                    except asyncio.TimeoutError:
+                                        log.warning("⏳ Identity resolution timed out, proceeding with current state.")
+
+                                    # Build system prompt with whatever context is available
+                                    system_prompt = self._build_system_prompt(session.user_context)
+                                    
                                     # Ask Gemma (this will handle tools internally)
-                                    reply = await self.ask_gemma(client, history)
+                                    reply = await self.ask_gemma(client, history, system_prompt=system_prompt, session=session)
                                     log.info(f"🤖 Gemma: {reply}")
                                     session.add_assistant_turn(reply)
                                     
@@ -242,9 +255,10 @@ class AudioSocketBridge:
         except Exception as e:
             log.error(f"Error in write_audio: {e}")
 
-    async def ask_gemma(self, client, history):
+    async def ask_gemma(self, client, history, system_prompt: str = None, session: Session = None):
         """Recursively queries Gemma, executing any requested tools until a final text response is received."""
-        messages = [{"role": "system", "content": self.system_msg}] + history
+        actual_system = system_prompt or self.system_msg
+        messages = [{"role": "system", "content": actual_system}] + history
         
         try:
             # Send request with tools enabled
@@ -268,8 +282,34 @@ class AudioSocketBridge:
                     
                     if name in TOOL_MAP:
                         log.info(f"🛠️ Executing tool: {name}({args})")
-                        result = TOOL_MAP[name](**args)
+                        func = TOOL_MAP[name]
+                        if asyncio.iscoroutinefunction(func):
+                            # Special handling for identity tools: inject caller_number
+                            if name == "verify_voice_token":
+                                result = await func(caller_number=session.caller_number, **args)
+                            elif name == "get_recent_activity":
+                                result = await func(user_id=session.user_context.user_id, **args)
+                            else:
+                                result = await func(**args)
+                        else:
+                            result = func(**args)
+                            
+                        # Handle Mid-call authentication
+                        if name == "login_to_account" and "successful" in str(result).lower():
+                            from shared.identity import perform_api_login, resolve_by_token
+                            username = args.get("username")
+                            password = args.get("password")
+                            success, token = await perform_api_login(username, password)
+                            if success:
+                                session.auth_token = token
+                                session.user_context = await resolve_by_token(token)
+                                log.info(f"🔑 Outside user successfully authenticated: {session.user_context.username}")
                         
+                        # Handle Data Fetching with Token support
+                        if name == "get_recent_activity" and session.auth_token:
+                            # Re-run the tool with the token injected
+                            result = await func(user_id=None, token=session.auth_token)
+
                         # Add tool result to history
                         history.append({
                             "role": "tool",
@@ -281,10 +321,60 @@ class AudioSocketBridge:
                         log.warning(f"⚠️ Tool {name} not found in registry")
 
                 # Re-query Gemma with the tool results included in history
-                return await self.ask_gemma(client, history)
+                return await self.ask_gemma(client, history, system_prompt=system_prompt, session=session)
 
             # No more tool calls, return the final text
             return message.get("content") or ""
         except Exception as e:
             log.error(f"Gemma tool loop error: {e}")
             return "Sorry, I'm having trouble responding right now."
+
+    def _build_system_prompt(self, profile) -> str:
+        """Constructs a system prompt based on Space Identity (Owner vs Guest)."""
+        
+        # GUEST / RECEPTIONIST MODE
+        if profile.user_id == "":
+            return (
+                "You are Gemma, a professional AI Receptionist for Project Echo. "
+                "You do not recognize this local space connection. "
+                "You must be helpful and polite, but you CANNOT access any personal account data. "
+                "If the caller asks for personal info, say that you are currently in receptionist mode "
+                "and they need to call from their registered local space."
+            )
+
+        # OWNER / PERSONAL ASSISTANT MODE
+        status_str = "Active" if profile.is_active else "Inactive"
+        return (
+            f"You are Gemma, the private AI Assistant for {profile.username}. "
+            "You have identified this call as coming from their registered Local Space. "
+            f"User Profile: {profile.username}, Status: {status_str}, Joined: {profile.member_since}. "
+            "You have full access to their account data. Be personal, helpful, and proactive."
+        )
+
+        if profile.fetch_error:
+            return (
+                "You are Gemma, a helpful voice assistant for Project Echo. "
+                f"User profile could not be loaded ({profile.fetch_error}). "
+                "Help the caller as best you can without account-specific details. "
+                "If they ask about their account, say the Project Echo systems are briefly unavailable."
+            )
+
+        status_str = "Active" if profile.is_active else "Inactive"
+        parts = [
+            "You are Gemma, a helpful voice assistant for Project Echo.",
+            f"The caller is identified as {profile.username}.",
+            f"Account Status: {status_str}.",
+            f"Joined Project Echo on: {profile.member_since}.",
+        ]
+        
+        if not profile.is_active:
+            parts.append(
+                "WARNING: this account is currently Inactive. "
+                "Advise the user to contact support to reactivate their account."
+            )
+            
+        parts.append(
+            "Do not read out the user_id or email to the caller. "
+            "Answer questions using the above Project Echo context."
+        )
+        return " ".join(parts)

@@ -15,12 +15,31 @@ class Session:
         self.start_time = time.time()
         self.conversation = ConversationBuffer(session_id, caller_number)
         self.audio = TempAudioStore(session_id)
+        
+        # Identity Context
+        from shared.models import UNRESOLVED_PROFILE
+        self.user_context = UNRESOLVED_PROFILE
+        self.auth_token = None
+        self.context_ready = asyncio.Event()
 
     def start(self):
         """Initializes storage and opens resources."""
         init_db()
         self.audio.open()
         log.info(f"Session {self.session_id} started for {self.caller_number}")
+
+    async def preload_user_context(self):
+        """
+        Fetches user data from Project Echo based on the connection Space ID.
+        """
+        from shared.identity import get_full_user_context
+        try:
+            # We use the caller_number variable as the 'Space ID' (Connection IP)
+            self.user_context = await get_full_user_context(self.caller_number)
+        except Exception as e:
+            log.error(f"⚠️ Preload failed: {e}")
+        finally:
+            self.context_ready.set()
 
     def add_user_turn(self, text: str):
         """Records user transcription."""
@@ -29,6 +48,66 @@ class Session:
     def add_assistant_turn(self, text: str):
         """Records assistant response."""
         self.conversation.add_assistant_turn(text)
+
+    async def generate_response(self) -> str:
+        """
+        Triggers the Gemma AI to generate a response based on the current context.
+        Supports both Receptionist and Personal Assistant personas.
+        """
+        from src.tools.registry import TOOLS, TOOL_MAP
+        from src.core.instances import agent # Global agent instance
+        
+        # 1. Determine Persona
+        if self.user_context.username != "Unresolved":
+            persona_name = "Private Personal Assistant"
+            identity_info = f"You are talking to {self.user_context.username}. You have access to their personal data."
+        else:
+            persona_name = "Professional Receptionist"
+            identity_info = "The caller is anonymous. Do not share personal info until they log in using the login_to_account tool."
+
+        system_msg = f"You are Gemma, a {persona_name}. {identity_info} Be concise and helpful."
+        
+        # 2. Generate with Gemma
+        prompt = self.conversation.get_last_user_turn()
+        history = self.conversation.get_history()[:-1] # Exclude current turn
+        
+        response = await agent.generate_text(
+            prompt=prompt,
+            history=history,
+            system_msg=system_msg,
+            tools=TOOLS
+        )
+        
+        # 3. Handle Tool Calls (The Login/Data Flow)
+        if "tool_calls" in response:
+            for tool_call in response["tool_calls"]:
+                name = tool_call["function"]["name"]
+                args = tool_call["function"]["arguments"]
+                
+                log.info(f"🛠️ Agent calling tool: {name}")
+                if name in TOOL_MAP:
+                    tool_func = TOOL_MAP[name]
+                    # Execute tool
+                    if asyncio.iscoroutinefunction(tool_func):
+                        result = await tool_func(**args)
+                    else:
+                        result = tool_func(**args)
+                    
+                    # Special Case: Login upgrade
+                    if name == "login_to_account" and "successful" in result.lower():
+                        from shared.identity import resolve_by_token
+                        # Extract token if needed, or just re-resolve profile
+                        # For this demo, we re-resolve to the authenticated profile
+                        self.user_context = await resolve_by_token("dummy-token")
+                        log.info(f"✅ Session UPGRADED to {self.user_context.username}")
+                    
+                    # Add tool result to conversation and generate final text
+                    self.conversation.add_system_turn(f"Tool {name} result: {result}")
+                    return await self.generate_response() # Recursive call for final text
+        
+        response_text = response.get("content", "I'm sorry, I encountered an error.")
+        self.add_assistant_turn(response_text)
+        return response_text
 
     def append_audio(self, pcm_bytes: bytes):
         """Streams incoming audio to temporary storage."""

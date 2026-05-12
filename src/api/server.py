@@ -7,28 +7,25 @@ import tempfile
 from contextlib import asynccontextmanager
 from typing import Optional, List
 
-from fastapi import FastAPI, UploadFile, File, Request, HTTPException
+from fastapi import FastAPI, UploadFile, File, Request, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 
 from src.config.settings import HOST, PORT, LOG_LEVEL
 from src.config.constants import MODEL_ID
-from src.adapters.gemma import GemmaAdapter
-from src.adapters.whisper import WhisperAdapter
-from src.core.agent import GemmaAgent
-from src.core.audio import resample_to_16k
+from src.core.instances import agent, gemma_adapter, whisper_adapter
 
-# Initialize components
-gemma_adapter = GemmaAdapter()
-whisper_adapter = WhisperAdapter()
-agent = GemmaAgent(gemma_adapter, whisper_adapter)
+from src.bridge.twilio import TwilioStreamBridge
+
+twilio_bridge = TwilioStreamBridge()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print(f"[*] Loading models...")
     gemma_adapter.load()
     whisper_adapter.load()
+    twilio_bridge.load()
     print(f"[OK] Models loaded - streaming={'native' if gemma_adapter.has_async_send else 'simulated'}")
     yield
     gemma_adapter.close()
@@ -38,6 +35,10 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+@app.websocket("/twiliostream")
+async def twilio_stream_endpoint(websocket: WebSocket):
+    await twilio_bridge.handle_websocket(websocket)
 
 app.add_middleware(
     CORSMiddleware,

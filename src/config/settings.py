@@ -50,3 +50,9 @@ DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = str(DATA_DIR / "calls.db")
 TEMP_AUDIO_DIR = str(DATA_DIR / "temp_audio")
+
+# Cloud PostgreSQL Settings
+CLOUD_DB_HOST = os.getenv("CLOUD_DB_HOST", "your-db-host.com")
+CLOUD_DB_NAME = os.getenv("CLOUD_DB_NAME", "main_system")
+CLOUD_DB_USER = os.getenv("CLOUD_DB_USER", "voice_assistant")
+CLOUD_DB_PASS = os.getenv("CLOUD_DB_PASS", "secure_password")
