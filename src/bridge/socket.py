@@ -33,7 +33,7 @@ class AudioSocketBridge:
             self.tts = PiperAdapter(PIPER_MODEL_PATH)
             
         self.whisper = WhisperAdapter()
-        self.vad = VADAdapter(threshold=0.5)
+        self.vad = VADAdapter(threshold=0.85)
         self.greeting_cache: Optional[bytes] = None
         self.playback_task: Optional[asyncio.Task] = None
 
@@ -124,6 +124,11 @@ class AudioSocketBridge:
                             log.info("✂️ User interrupted AI (Speech detected)")
                             self.playback_task.cancel()
                             self.playback_task = None
+                            
+                        if hasattr(self, 'gemma_task') and self.gemma_task and not self.gemma_task.done():
+                            log.info("✂️ User interrupted AI (Thinking)")
+                            self.gemma_task.cancel()
+                            self.gemma_task = None
                         
                         silence_count = 0
                         speaking = True
@@ -135,9 +140,10 @@ class AudioSocketBridge:
 
                     # Flush speech
                     if (speaking and silence_count >= SILENCE_FRAMES_NEEDED) or len(speech_buf) >= MAX_SPEECH_FRAMES:
-                        if len(speech_buf) >= MIN_SPEECH_FRAMES:
-                            log.info(f"🎙️ Processing {len(speech_buf)} frames of speech...")
-                            trimmed = speech_buf[:len(speech_buf)-silence_count]
+                        trimmed = speech_buf[:len(speech_buf)-silence_count]
+                        if len(trimmed) >= MIN_SPEECH_FRAMES:
+                            speech_end_time = time.time()
+                            log.info(f"🎙️ Processing {len(trimmed)} frames of speech...")
                             wav_bytes = pcm8k_to_wav_bytes(trimmed)
                             
                             import tempfile
@@ -149,9 +155,10 @@ class AudioSocketBridge:
                             try:
                                 user_text = await asyncio.to_thread(self.whisper.transcribe, tmp_path)
                                 os.remove(tmp_path)
+                                t_whisper = time.time() - speech_end_time
 
                                 if user_text:
-                                    log.info(f"👤 User: {user_text}")
+                                    log.info(f"👤 User: {user_text} (Whisper Latency: {t_whisper:.2f}s)")
                                     session.add_user_turn(user_text)
                                     # Add user message to history once
                                     history.append({"role": "user", "content": user_text})
@@ -165,22 +172,40 @@ class AudioSocketBridge:
 
                                     # Build system prompt with whatever context is available
                                     system_prompt = self._build_system_prompt(session.user_context)
+
+                                    # We must NOT block the read loop, otherwise Asterisk/SIP clients will drop the call due to timeout!
+                                    async def process_gemma_and_speak(text_prompt, current_history, current_system_prompt, start_time):
+                                        try:
+                                            # Play a quick filler so the user knows we are thinking and the SIP client receives RTP (prevents 30s timeout drop)
+                                            filler_pcm = await asyncio.to_thread(self.tts.synthesize_to_pcm8k, "Let me think about that...")
+                                            await self.write_audio(writer, filler_pcm)
+                                            
+                                            gemma_start_time = time.time()
+                                            reply = await self.ask_gemma(client, current_history, system_prompt=current_system_prompt, session=session)
+                                            t_gemma = time.time() - gemma_start_time
+                                            t_total = time.time() - start_time
+                                            
+                                            log.info(f"🤖 Gemma: {reply} (LLM: {t_gemma:.2f}s | Total Latency: {t_total:.2f}s)")
+                                            session.add_assistant_turn(reply)
+                                            
+                                            # Add assistant response to history
+                                            current_history.append({"role": "assistant", "content": reply})
+                                            
+                                            reply_pcm = await asyncio.to_thread(self.tts.synthesize_to_pcm8k, reply)
+                                            # Start playback as a background task to allow interruptions
+                                            self.playback_task = asyncio.create_task(self.write_audio(writer, reply_pcm))
+                                        except asyncio.CancelledError:
+                                            log.info("✂️ Gemma thinking task cancelled by barge-in")
+                                        except Exception as e:
+                                            log.error(f"❌ Transcription/LLM error: {e}")
+
+                                    # Run asynchronously so we keep reading frames!
+                                    self.gemma_task = asyncio.create_task(process_gemma_and_speak(user_text, history, system_prompt, speech_end_time))
                                     
-                                    # Ask Gemma (this will handle tools internally)
-                                    reply = await self.ask_gemma(client, history, system_prompt=system_prompt, session=session)
-                                    log.info(f"🤖 Gemma: {reply}")
-                                    session.add_assistant_turn(reply)
-                                    
-                                    # Add assistant response to history
-                                    history.append({"role": "assistant", "content": reply})
-                                    
-                                    reply_pcm = await asyncio.to_thread(self.tts.synthesize_to_pcm8k, reply)
-                                    # Start playback as a background task to allow interruptions
-                                    self.playback_task = asyncio.create_task(self.write_audio(writer, reply_pcm))
                                 else:
                                     log.info("   (empty transcription)")
                             except Exception as e:
-                                log.error(f"❌ Transcription/LLM error: {e}")
+                                log.error(f"❌ Whisper transcription error: {e}")
 
                         speech_buf = []
                         silence_count = 0
@@ -188,9 +213,17 @@ class AudioSocketBridge:
                         last_activity = time.time()
                         proactive_prompted = False
                     else:
-                        # Check for silence timeouts
-                        current_time = time.time()
-                        silence_duration = current_time - last_activity
+                        is_thinking = hasattr(self, 'gemma_task') and self.gemma_task and not self.gemma_task.done()
+                        is_speaking = self.playback_task and not self.playback_task.done()
+                        
+                        if is_thinking or is_speaking:
+                            # Reset last_activity while the AI is busy, so we don't time out
+                            last_activity = time.time()
+                            silence_duration = 0
+                        else:
+                            # Check for silence timeouts
+                            current_time = time.time()
+                            silence_duration = current_time - last_activity
                         
                         if silence_duration > SILENCE_HANGUP_TIMEOUT:
                             log.info(f"⌛ Silence timeout ({SILENCE_HANGUP_TIMEOUT}s). Automatic hangup.")
@@ -263,7 +296,7 @@ class AudioSocketBridge:
         try:
             # Send request with tools enabled
             payload = {"messages": messages, "tools": TOOLS}
-            resp = await client.post(f"{self.gemma_url}/v1/chat/completions", json=payload, timeout=30)
+            resp = await client.post(f"{self.gemma_url}/v1/chat/completions", json=payload, timeout=120.0)
             data = resp.json()
             message = data["choices"][0]["message"]
             
@@ -332,14 +365,16 @@ class AudioSocketBridge:
     def _build_system_prompt(self, profile) -> str:
         """Constructs a system prompt based on Space Identity (Owner vs Guest)."""
         
+        conciseness_rule = " CRITICAL INSTRUCTION: This is a spoken voice conversation. You MUST keep your responses extremely short and concise. Answer in 1 to 3 sentences maximum. DO NOT ask follow-up questions, DO NOT offer further assistance, and DO NOT say things like 'I can assist with Project Echo tasks'. Answer the prompt directly and stop talking."
+        
         # GUEST / RECEPTIONIST MODE
         if profile.user_id == "":
             return (
-                "You are Gemma, a professional AI Receptionist for Project Echo. "
+                "You are Gemma, an AI Assistant for Project Echo. "
                 "You do not recognize this local space connection. "
-                "You must be helpful and polite, but you CANNOT access any personal account data. "
-                "If the caller asks for personal info, say that you are currently in receptionist mode "
-                "and they need to call from their registered local space."
+                "You CANNOT access any personal account data. "
+                "If the caller asks for personal info, say that they need to call from their registered local space. "
+                + conciseness_rule
             )
 
         # OWNER / PERSONAL ASSISTANT MODE
@@ -348,7 +383,8 @@ class AudioSocketBridge:
             f"You are Gemma, the private AI Assistant for {profile.username}. "
             "You have identified this call as coming from their registered Local Space. "
             f"User Profile: {profile.username}, Status: {status_str}, Joined: {profile.member_since}. "
-            "You have full access to their account data. Be personal, helpful, and proactive."
+            "You have full access to their account data. Be direct and concise. "
+            + conciseness_rule
         )
 
         if profile.fetch_error:

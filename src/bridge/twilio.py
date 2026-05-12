@@ -14,6 +14,7 @@ from src.adapters.piper import PiperAdapter
 from src.adapters.kokoro import KokoroAdapter
 from src.core.instances import whisper_adapter
 from src.core.instances import gemma_adapter # ensure gemma is available if needed
+from src.adapters.vad import VADAdapter
 
 log = logging.getLogger("twilio_bridge")
 

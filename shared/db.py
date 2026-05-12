@@ -21,7 +21,7 @@ async def startup() -> None:
             min_size=PG_MIN_POOL,
             max_size=PG_MAX_POOL,
             command_timeout=10,       # query-level hard ceiling
-            ssl="require",            # always encrypted to cloud PostgreSQL
+            ssl=False,            # disable SSL for local development
         )
         logger.info("PostgreSQL pool ready (%d–%d connections)", PG_MIN_POOL, PG_MAX_POOL)
     except Exception as e:

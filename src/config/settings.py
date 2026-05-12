@@ -1,9 +1,11 @@
 import os
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
 
 # Base Directory
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
+load_dotenv(BASE_DIR / ".env")
 
 # Model Paths
 DEFAULT_MODEL = os.environ.get("GEMMA_MODEL_PATH")

@@ -25,7 +25,7 @@ async def my_gemma_summarise(text):
                     {"role": "user", "content": text}
                 ]
             }
-            resp = await client.post(f"{GEMMA_URL}/v1/chat/completions", json=payload, timeout=30)
+            resp = await client.post(f"{GEMMA_URL}/v1/chat/completions", json=payload, timeout=120.0)
             return resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
         return f"Summary failed: {e}"
@@ -40,7 +40,7 @@ async def my_gemma_sentiment(text):
                     {"role": "user", "content": text}
                 ]
             }
-            resp = await client.post(f"{GEMMA_URL}/v1/chat/completions", json=payload, timeout=15)
+            resp = await client.post(f"{GEMMA_URL}/v1/chat/completions", json=payload, timeout=120.0)
             return resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
         return f"Sentiment failed: {e}"

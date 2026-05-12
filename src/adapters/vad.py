@@ -19,24 +19,32 @@ class VADAdapter:
         self.model = load_silero_vad()
         self.threshold = threshold
         self.sample_rate = 8000
+        self.buffer = b""
         
     def is_speech(self, pcm_frame: bytes) -> bool:
         """
         Analyzes a PCM frame (8kHz mono).
         """
+        self.buffer += pcm_frame
+        
+        # Silero VAD at 8000Hz strictly requires exactly 256 samples (512 bytes)
+        if len(self.buffer) < 512:
+            return False
+            
+        chunk_to_process = self.buffer[:512]
+        self.buffer = self.buffer[512:]
+        
         try:
             # Convert bytes to float32 numpy array as expected by Silero
-            audio_float32 = np.frombuffer(pcm_frame, dtype=np.int16).astype(np.float32) / 32768.0
+            audio_float32 = np.frombuffer(chunk_to_process, dtype=np.int16).astype(np.float32) / 32768.0
             
-            # Use get_speech_timestamps or the raw model call
-            # For real-time, we can just check the probability
             import torch
             audio_tensor = torch.from_numpy(audio_float32)
             
             speech_prob = self.model(audio_tensor, self.sample_rate).item()
             return speech_prob > self.threshold
         except Exception as e:
-            log.debug(f"Silero VAD Error: {e}")
+            log.error(f"Silero VAD Error: {e}")
             return False
 
     def contains_speech(self, pcm_data: bytes) -> bool:

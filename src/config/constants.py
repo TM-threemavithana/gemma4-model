@@ -7,7 +7,7 @@ SAMPLE_RATE_KOKORO = 24000
 # Silence Detection
 SILENCE_THRESHOLD = 500
 SILENCE_FRAMES_NEEDED = 40  # 40 * 20ms = 0.8s
-MIN_SPEECH_FRAMES = 10     # 200ms
+MIN_SPEECH_FRAMES = 25     # 500ms (to ignore breathing/coughs)
 MAX_SPEECH_FRAMES = 500    # 10s
 
 # AudioSocket (Asterisk)

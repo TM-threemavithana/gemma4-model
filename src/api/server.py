@@ -56,61 +56,64 @@ async def health():
         "engine_ready": gemma_adapter.engine is not None,
     }
 
+agent_lock = asyncio.Lock()
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    body = await request.json()
-    messages = body.get("messages", [])
-    if not messages:
-        raise HTTPException(status_code=400, detail="'messages' must be a non-empty list")
-
-    stream = body.get("stream", False)
-    # Simplified logic for now, using agent.generate_text
-    prompt = messages[-1].get("content", "")
-    history = messages[:-1]
+    async with agent_lock:
+        body = await request.json()
+        messages = body.get("messages", [])
+        if not messages:
+            raise HTTPException(status_code=400, detail="'messages' must be a non-empty list")
     
-    # Handle system message separately if present
-    system_msg = next((m["content"] for m in messages if m["role"] == "system"), None)
-    history = [m for m in history if m["role"] != "system"]
-
-    tools_json = body.get("tools")
+        stream = body.get("stream", False)
+        # Simplified logic for now, using agent.generate_text
+        prompt = messages[-1].get("content", "")
+        history = messages[:-1]
+        
+        # Handle system message separately if present
+        system_msg = next((m["content"] for m in messages if m["role"] == "system"), None)
+        history = [m for m in history if m["role"] != "system"]
     
-    # LiteRT LM requires actual Python callables for tools
-    from src.tools.registry import TOOL_MAP
-    resolved_tools = []
-    if tools_json:
-        for t in tools_json:
-            name = t.get("function", {}).get("name")
-            if name in TOOL_MAP:
-                resolved_tools.append(TOOL_MAP[name])
-
-    if stream:
-        # For simplicity in this initial refactor, we'll implement a basic stream
-        return StreamingResponse(_mock_stream(prompt), media_type="text/event-stream")
+        tools_json = body.get("tools")
+        
+        # LiteRT LM requires actual Python callables for tools
+        from src.tools.registry import TOOL_MAP
+        resolved_tools = []
+        if tools_json:
+            for t in tools_json:
+                name = t.get("function", {}).get("name")
+                if name in TOOL_MAP:
+                    resolved_tools.append(TOOL_MAP[name])
     
-    agent_response = await agent.generate_text(prompt, history=history, system_msg=system_msg, tools=resolved_tools)
+        if stream:
+            # For simplicity in this initial refactor, we'll implement a basic stream
+            return StreamingResponse(_mock_stream(prompt), media_type="text/event-stream")
+        
+        agent_response = await agent.generate_text(prompt, history=history, system_msg=system_msg, tools=resolved_tools)
+        
+        # Handle the response structure
+        message_content = ""
+        tool_calls = None
+        
+        if isinstance(agent_response, dict):
+            parts = agent_response.get("content", [])
+            message_content = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+            tool_calls = agent_response.get("tool_calls")
+        else:
+            message_content = str(agent_response)
     
-    # Handle the response structure
-    message_content = ""
-    tool_calls = None
+        message = {"role": "assistant", "content": message_content}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
     
-    if isinstance(agent_response, dict):
-        parts = agent_response.get("content", [])
-        message_content = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
-        tool_calls = agent_response.get("tool_calls")
-    else:
-        message_content = str(agent_response)
-
-    message = {"role": "assistant", "content": message_content}
-    if tool_calls:
-        message["tool_calls"] = tool_calls
-
-    return {
-        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": MODEL_ID,
-        "choices": [{"message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}],
-    }
+        return {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": MODEL_ID,
+            "choices": [{"message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}],
+        }
 
 async def _mock_stream(prompt):
     # Placeholder for actual streaming logic
