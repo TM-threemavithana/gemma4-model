@@ -100,7 +100,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "query_project_echo",
-            "description": "Look up the owner's personal details, name, or identity from Project Echo to answer questions on their behalf.",
+            "description": "Look up the owner's personal details, business offerings, pricing packages, or identity from Project Echo to answer questions on their behalf.",
             "parameters": {
                 "type": "object",
                 "properties": {

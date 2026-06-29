@@ -7,7 +7,7 @@ from src.bridge.socket import AudioSocketBridge
 from src.config.settings import HOST, PORT, ASTERISK_PORT, LOG_LEVEL, GEMMA_URL
 from src.storage.database import init_db
 from src.core import post_processing
-from shared.db import startup as db_startup, shutdown as db_shutdown
+# from shared.db import startup as db_startup, shutdown as db_shutdown
 
 def setup_logging():
     logging.basicConfig(
@@ -69,11 +69,12 @@ def main():
         run_server()
     elif args.mode == "bridge":
         async def run_bridge_with_db():
-            await db_startup()
+            # await db_startup()
             try:
                 await run_bridge()
             finally:
-                await db_shutdown()
+                pass
+                # await db_shutdown()
         asyncio.run(run_bridge_with_db())
     else:
         # Run both in separate threads/loops
@@ -81,11 +82,12 @@ def main():
         server_thread.start()
         
         async def run_all_with_db():
-            await db_startup()
+            # await db_startup()
             try:
                 await run_bridge()
             finally:
-                await db_shutdown()
+                pass
+                # await db_shutdown()
 
         try:
             asyncio.run(run_all_with_db())

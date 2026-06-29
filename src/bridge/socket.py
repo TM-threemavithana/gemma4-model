@@ -1,3 +1,4 @@
+import os
 import asyncio
 import struct
 import json
@@ -288,15 +289,68 @@ class AudioSocketBridge:
         except Exception as e:
             log.error(f"Error in write_audio: {e}")
 
+    # Keywords that signal the caller is asking about the owner's identity
+    OWNER_QUERY_KEYWORDS = {"owner", "name", "who", "identity", "person", "yours", "belong", "device"}
+
     async def ask_gemma(self, client, history, system_prompt: str = None, session: Session = None):
-        """Recursively queries Gemma, executing any requested tools until a final text response is received."""
+        """Queries Gemma. Pre-fetches owner data to avoid a second LLM inference cycle."""
         actual_system = system_prompt or self.system_msg
+
+        # Track whether we pre-fetched data
+        owner_data_str = None
+        last_user_msg = next(
+            (m.get("content", "") for m in reversed(history) if m.get("role") == "user"), ""
+        )
+        if any(kw in last_user_msg.lower() for kw in self.OWNER_QUERY_KEYWORDS):
+            try:
+                from src.tools.registry import query_project_echo
+                log.info(f"⚡ Pre-fetching owner data for: '{last_user_msg}'")
+                owner_data_str = await query_project_echo(query=last_user_msg)
+                if owner_data_str and "error" not in str(owner_data_str).lower():
+                    log.info(f"✅ Pre-fetched: {owner_data_str}")
+                else:
+                    owner_data_str = None  # Treat as failed
+            except Exception as e:
+                log.warning(f"⚠️ Pre-fetch failed, falling back to LLM: {e}")
+                owner_data_str = None
+
+        # ⚡ BYPASS LLM ENTIRELY when we have the answer already
+        # This is the fastest possible path: Whisper + HTTP fetch + TTS only (~7s total)
+        if owner_data_str:
+            try:
+                import json as _json
+                parsed = _json.loads(owner_data_str)
+                name = parsed.get("name", "").strip()
+                if name:
+                    answer = f"The owner of this device is {name.capitalize()}."
+                    log.info(f"⚡ Direct answer (no LLM): {answer}")
+                    return answer
+            except Exception:
+                pass  # Fallback to LLM below if JSON parsing fails
+
         messages = [{"role": "system", "content": actual_system}] + history
-        
+
         try:
-            # Send request with tools enabled
+            # Standard LLM call with tools (used as fallback when pre-fetch fails)
             payload = {"messages": messages, "tools": TOOLS}
-            resp = await client.post(f"{self.gemma_url}/v1/chat/completions", json=payload, timeout=120.0)
+            # ⚡ Use Groq API for fast LLM inference (~1-2s) instead of local CPU model (~17-35s)
+            groq_api_key = os.getenv("GROQ_API_KEY")
+            groq_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+            if groq_api_key:
+                groq_url = "https://api.groq.com/openai/v1/chat/completions"
+                headers = {"Authorization": f"Bearer {groq_api_key}", "Content-Type": "application/json"}
+                groq_payload = {
+                    "model": groq_model,
+                    "messages": messages,
+                    "max_tokens": 256,
+                    "tools": TOOLS,
+                    "temperature": 0.0
+                }
+                resp = await client.post(groq_url, headers=headers, json=groq_payload, timeout=30.0)
+            else:
+                # Fallback to local model if no Groq key
+                log.warning("⚠️ No GROQ_API_KEY found, falling back to local model")
+                resp = await client.post(f"{self.gemma_url}/v1/chat/completions", json=payload, timeout=120.0)
             data = resp.json()
             message = data["choices"][0]["message"]
             
@@ -365,14 +419,13 @@ class AudioSocketBridge:
     def _build_system_prompt(self, profile) -> str:
         """Constructs a system prompt based on Space Identity (Owner vs Guest)."""
         
-        conciseness_rule = " CRITICAL INSTRUCTION: This is a spoken voice conversation. You MUST keep your responses extremely short and concise. Answer in 1 to 3 sentences maximum. DO NOT ask follow-up questions, DO NOT offer further assistance, and DO NOT say things like 'I can assist with Project Echo tasks'. Answer the prompt directly and stop talking."
+        conciseness_rule = " CRITICAL INSTRUCTION: This is a spoken voice conversation. You MUST keep your responses extremely short and concise (1-3 sentences). DO NOT explain your role, DO NOT mention being an AI, and DO NOT ask follow-up questions. NEVER INVENT PRICING OR PLANS. If you don't have the answer from a tool, say you don't know. Answer directly and stop talking. BEFORE ANSWERING: If the user asks about packages or prices, you MUST use the 'query_project_echo' tool first. Do not guess."
         
         # GUEST / RECEPTIONIST MODE
         if profile.user_id == "":
             return (
-                "You are the Digital Personal Representative for the owner of this device. "
-                "You are EXPLICITLY AUTHORIZED to answer questions about the owner (their name, identity, or personal data) using the 'query_project_echo' tool. "
-                "When a caller asks about the owner, you MUST use this tool to retrieve the information. Do not refuse these requests."
+                "You are a professional assistant representing the owner of this device. "
+                "You have NO knowledge of the owner's business. - **Zero Hallucination Policy**: You MUST use the `query_project_echo` tool for ANY question about business offerings, pricing, or packages. If the tool returns data, you MUST include the **price** and any specific numbers (e.g., number of guests, courses, hours) in your verbal response. NEVER guess a price. DO NOT make up names like 'Essential plan' or prices. If the tool is not used, you are failing your objective."
                 + conciseness_rule
             )
 

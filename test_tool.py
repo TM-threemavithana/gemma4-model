@@ -12,7 +12,7 @@ async def run_test():
     print("--------------------------------------------------")
     
     # Let's ask a question an outside caller would ask
-    test_query = "Who is the owner of this phone?" 
+    test_query = "Hi, can I get the details on your cheapest package available?" 
     
     print(f"Sending query: '{test_query}'")
     

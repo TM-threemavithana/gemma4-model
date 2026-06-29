@@ -40,3 +40,6 @@ calls.db
 local_token.txt
 # WSL specific
 .wslconfig
+
+# Documentation
+docs/
